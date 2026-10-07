@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@layer base {
+  body {
+    @apply bg-slate-50 text-slate-900 antialiased;
+    /* Soft, premium light gradient */
+    background-image: 
+      radial-gradient(circle at top right, rgba(16, 185, 129, 0.08), transparent 40%),
+      radial-gradient(circle at bottom left, rgba(59, 130, 246, 0.08), transparent 40%);
+    background-attachment: fixed;
+    min-height: 100vh;
+  }
+}
+
+@layer components {
+  .glass-panel {
+    @apply bg-white/90 backdrop-blur-xl border border-slate-200 shadow-xl;
+  }
+  
+  .glass-card {
+    @apply bg-white/70 backdrop-blur-md border border-slate-200 transition-all duration-300;
+  }
+  
+  .glass-card:hover {
+    @apply border-slate-300 transform -translate-y-1 bg-white shadow-lg;
+  }
+  
+  .glow-green {
+    @apply border-emerald-400 bg-emerald-50 shadow-[0_0_15px_rgba(16,185,129,0.15)] text-emerald-800;
+  }
+  
+  .glow-green:hover {
+    @apply border-emerald-500 shadow-[0_0_25px_rgba(16,185,129,0.2)] bg-emerald-100/50 transform -translate-y-1;
+  }
+}

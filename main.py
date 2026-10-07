@@ -1,21 +1,23 @@
-import os, json, asyncio, base64, httpx, difflib
+import os, json, asyncio, base64, httpx, difflib, wave, io
 from datetime import datetime
-from fastapi import FastAPI, Request, WebSocket
+from fastapi import FastAPI, Request, WebSocket, HTTPException
 from fastapi.responses import Response
 from pydantic import BaseModel
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse, Connect
 from groq import Groq
-from deepgram import (
-    DeepgramClient,
-    LiveTranscriptionEvents,
-    LiveOptions,
-)
-from deepgram.clients.listen import LiveTranscriptionEvents
+from deepgram import DeepgramClient, LiveTranscriptionEvents, LiveOptions
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from database import get_db, init_db
 from menu import MENU
+
+# audioop was removed in Python 3.13 — fall back to audioop-lts
+try:
+    import audioop
+except ModuleNotFoundError:
+    import audioop_lts as audioop  # pip install audioop-lts
+
 
 load_dotenv()
 
@@ -23,6 +25,9 @@ app = FastAPI()
 
 class CallRequest(BaseModel):
     table_number: int
+
+# Global lock to prevent Voicebox from crashing on concurrent TTS requests
+tts_lock = asyncio.Lock()
 
 # Hardcoded for Twilio Trial
 CUSTOMER_PHONE = "+917483691261"
@@ -52,27 +57,24 @@ deepgram      = DeepgramClient(os.environ["DEEPGRAM_KEY"])
 TWILIO_NUMBER = os.environ["TWILIO_NUMBER"]
 SERVER_URL    = os.environ["SERVER_URL"]   # e.g. https://abc.ngrok.io
 
-# ── System prompt — edit this to match your use case ─────────────────────────
-SYSTEM_PROMPT = """# ROLE AND PERSONA
-You are a friendly and professional waiter at "The Grand Azure," an upscale restaurant.
-Your job is to greet the guest, take their order, and recommend special dishes if asked.
-Tone: Warm, polite, and helpful.
+# ── System prompt — built from menu.py so there's ONE source of truth ─────────
+def _build_menu_str() -> str:
+    """Generate a readable menu list directly from the MENU dictionary."""
+    return ", ".join(MENU.keys())
 
-# CRITICAL CONVERSATION RULES
-1. ONE QUESTION LIMIT: End every response with exactly ONE question to hand the conversation back to the user.
-2. CONCISENESS: Keep your responses under 2 sentences so they are easily spoken over the phone.
-3. AI CONCEALMENT: Never reveal you are an AI. You are a human waiter.
-4. TERMINATION: If the user wishes to finish their order or end the conversation, output exactly: [HANGUP]
+SYSTEM_PROMPT = """You are a friendly and fast AI waiter representing Veena Stores. You are speaking over a voice call to a customer at Table {{table_number}}.
 
-# MENU KNOWLEDGE
-- Special Dishes: Truffle Butter Filet Mignon, Pan-Seared Scallops with Lemon Risotto, and our famous Molten Chocolate Lava Cake.
-- Drinks: We have a full bar, freshly squeezed juices, and artisanal coffees.
+Here is your official menu (these are the ONLY items available):
+{menu_items}
 
-# CONVERSATIONAL FLOW
-1. Greet the guest warmly and ask if they are ready to order or if they'd like to hear the specials.
-2. Answer any questions about the menu or take their order.
-3. Once they order, confirm the items and ask if they need anything else (like drinks or dessert).
-4. When they say they are done, thank them, tell them their food will be right out, and output [HANGUP]."""
+YOUR CRITICAL RULES:
+1. NEVER MENTION PRICES: The customer has a physical menu card on their table. Do not speak about prices under any circumstances.
+2. VOICE FORMATTING: You are speaking over a phone line. Do not use bullet points, asterisks, bolding, or emojis. Write plain text that sounds completely natural when spoken aloud. Keep responses brief.
+3. EXACT GREETING: The system has already spoken the exact greeting. Do not repeat the greeting. Just naturally continue the conversation based on the user's reply.
+4. MENU INQUIRIES: If the customer asks what is available, read the items to them in a natural flow. Describe dishes appetizingly if asked. If they order something not on the menu, tell them it is unavailable and suggest an alternative.
+5. CUSTOMIZATION PROMPT: Once the customer tells you their initial order, quickly repeat back the items and quantities. Immediately after repeating it back, you MUST ask: "Any customizations needed for these?"
+6. FINAL CHECK: After noting any customizations they want (like "extra spicy" or "no onions"), you MUST ask: "Is there anything more?"
+7. CLOSING: When the customer indicates they are done (e.g., by saying "that's it", "no", "no more", "no need", or "thank you"), say exactly: "Perfect, I've sent that to the kitchen. Enjoy your meal! [HANGUP]" and stop speaking.""".format(menu_items=_build_menu_str())
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,20 +83,63 @@ Tone: Warm, polite, and helpful.
 @app.post("/call")
 async def call_table(request: CallRequest):
     table_number = request.table_number
-    
-    # Mark table as occupied
+
+    # 1. Validate table number range
+    if table_number < 1 or table_number > 20:
+        raise HTTPException(status_code=400, detail="Invalid table number. Must be between 1 and 20.")
+
+    # 2. Check table status in DB
     conn = get_db()
+    c = conn.cursor()
+    c.execute("SELECT status FROM tables WHERE id = ?", (table_number,))
+    table_row = c.fetchone()
+    if not table_row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Table {table_number} does not exist.")
+    if table_row["status"] == "Occupied":
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Table {table_number} is already occupied.")
+
+    # 3. Make Twilio call FIRST — only mark Occupied if it succeeds
+    try:
+        twilio_client.calls.create(
+            to=CUSTOMER_PHONE,
+            from_=TWILIO_NUMBER,
+            url=f"{SERVER_URL}/call-twiml/{table_number}",
+        )
+    except Exception as e:
+        conn.close()
+        print(f"[CALL ERROR] Twilio failed for Table {table_number}: {e}")
+        raise HTTPException(status_code=500, detail=f"Twilio call failed: {str(e)}")
+
     conn.execute("UPDATE tables SET status = 'Occupied' WHERE id = ?", (table_number,))
     conn.commit()
     conn.close()
-
-    twilio_client.calls.create(
-        to=CUSTOMER_PHONE,
-        from_=TWILIO_NUMBER,
-        url=f"{SERVER_URL}/call-twiml/{table_number}",
-    )
     print(f"[CALL] Dialing {CUSTOMER_PHONE} for Table {table_number}")
     return {"status": "ok", "table": table_number}
+
+
+@app.post("/form-submit")
+async def form_submit(request: Request):
+    """
+    Webhook target for the Google Apps Script (apps_script.js).
+    Google Forms sends arbitrary key/value JSON, e.g.:
+        {"Table Number": "5", "Name": "Charan"}
+    We search for any key containing 'table' (case-insensitive) and
+    extract the integer value, then delegate to call_table.
+    """
+    body: dict = await request.json()
+    table_number = None
+    for key, value in body.items():
+        if "table" in key.lower():
+            try:
+                table_number = int(str(value).strip())
+                break
+            except ValueError:
+                pass
+    if table_number is None:
+        raise HTTPException(status_code=400, detail=f"No 'table' field found in form data: {list(body.keys())}")
+    return await call_table(CallRequest(table_number=table_number))
 
 
 @app.api_route("/call-twiml/{table_number}", methods=["GET", "POST"])
@@ -147,20 +192,36 @@ async def media_stream(ws: WebSocket, table_number: int):
     await ws.accept()
     print(f"[WS] Call connected for Table {table_number}")
 
-    dynamic_prompt = SYSTEM_PROMPT + f"\n\nIMPORTANT: You are currently serving Table {table_number}."
-    conversation     = [{"role": "system", "content": dynamic_prompt}]
-    transcript_parts = []
-    stream_sid       = None
-    is_processing    = False  # prevent overlapping LLM calls
+    hour = datetime.now().hour
+    if hour < 12:
+        time_of_day = "morning"
+    elif hour < 17:
+        time_of_day = "noon"
+    else:
+        time_of_day = "evening"
+
+    # SYSTEM_PROMPT already has menu baked in; just fill the table number
+    dynamic_prompt = SYSTEM_PROMPT.replace("{table_number}", str(table_number))
+
+    opening_message = f"Good {time_of_day}, welcome to Veena Stores. Hi sir, what would you like to have today?"
+
+    conversation = [
+        {"role": "system", "content": dynamic_prompt},
+        {"role": "assistant", "content": opening_message}
+    ]
+    # Use a proper queue so STT results are NEVER dropped while LLM is running
+    transcript_queue: asyncio.Queue[str] = asyncio.Queue()
+    stream_sid        = None
+    conversation_task = None
 
     # ── Deepgram live STT connection ─────────────────────────────────────────
     dg_conn = deepgram.listen.asynclive.v("1")
 
     async def on_message(self, result, **kwargs):
-        nonlocal is_processing
         sentence = result.channel.alternatives[0].transcript
-        if result.is_final and sentence.strip() and not is_processing:
-            transcript_parts.append(sentence)
+        if result.is_final and sentence.strip():
+            # Always enqueue — never discard speech while LLM is busy
+            await transcript_queue.put(sentence)
             print(f"[STT] {sentence}")
 
     async def on_error(self, error, **kwargs):
@@ -179,57 +240,57 @@ async def media_stream(ws: WebSocket, table_number: int):
         endpointing=400,           # ms of silence = end of utterance
     ))
 
-    # ── Main message loop ────────────────────────────────────────────────────
+    # ── Main message loop — drains the queue so no speech is lost ───────────
     async def process_conversation():
-        nonlocal is_processing, stream_sid
+        nonlocal stream_sid
         while True:
-            await asyncio.sleep(0.5)
-            if transcript_parts and not is_processing:
-                is_processing = True
-                user_text = " ".join(transcript_parts).strip()
-                transcript_parts.clear()
+            # Block until a transcript arrives — no busy-polling
+            user_text = await transcript_queue.get()
 
-                print(f"[USER] {user_text}")
-                conversation.append({"role": "user", "content": user_text})
+            # Drain any additional segments that arrived while we waited
+            while not transcript_queue.empty():
+                user_text += " " + transcript_queue.get_nowait()
+            user_text = user_text.strip()
 
-                # Groq LLM reply
-                reply = groq_client.chat.completions.create(
-                    model="llama-3.3-70b-versatile",
-                    messages=conversation,
-                    max_tokens=250,
-                    temperature=0.7,
-                ).choices[0].message.content.strip()
+            print(f"[USER] {user_text}")
+            conversation.append({"role": "user", "content": user_text})
 
-                should_hangup = "[HANGUP]" in reply
+            # Groq LLM reply
+            reply = groq_client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=conversation,
+                max_tokens=250,
+                temperature=0.7,
+            ).choices[0].message.content.strip()
+
+            should_hangup = "[HANGUP]" in reply
+            if should_hangup:
+                reply = reply.replace("[HANGUP]", "").strip()
+
+            conversation.append({"role": "assistant", "content": reply})
+            print(f"[AGENT] {reply}")
+
+            print("\n" + "="*50)
+            print("FULL CONVERSATION SO FAR:")
+            for msg in conversation:
+                if msg["role"] == "user":
+                    print(f"  YOU  : {msg['content']}")
+                elif msg["role"] == "assistant":
+                    print(f"  AGENT: {msg['content']}")
+            print("="*50 + "\n")
+
+            # Voicebox TTS → send to Twilio
+            audio = await voicebox_tts(reply)
+            if audio and stream_sid:
+                await send_audio_to_twilio(ws, audio, stream_sid)
+
                 if should_hangup:
-                    reply = reply.replace("[HANGUP]", "").strip()
+                    print("[*] Agent requested hangup. Waiting for audio to finish playing...")
+                    await asyncio.sleep((len(audio) / 8000.0) + 1.0)
+                    await ws.close()
+                    return
 
-                conversation.append({"role": "assistant", "content": reply})
-                print(f"[AGENT] {reply}")
-
-                print("\n" + "="*50)
-                print("FULL CONVERSATION SO FAR:")
-                for msg in conversation:
-                    if msg["role"] == "user":
-                        print(f"  YOU  : {msg['content']}")
-                    elif msg["role"] == "assistant":
-                        print(f"  AGENT: {msg['content']}")
-                print("="*50 + "\n")
-
-                # Deepgram TTS → send to Twilio
-                audio = await deepgram_tts(reply)
-                if audio and stream_sid:
-                    await send_audio_to_twilio(ws, audio, stream_sid)
-                    
-                    if should_hangup:
-                        print("[*] Agent requested hangup. Waiting for audio to finish playing...")
-                        await asyncio.sleep((len(audio) / 8000.0) + 1.0)
-                        await ws.close()
-                        break
-
-                is_processing = False
-
-    asyncio.create_task(process_conversation())
+    conversation_task = asyncio.create_task(process_conversation())
 
     # ── Receive Twilio media frames ───────────────────────────────────────────
     try:
@@ -240,11 +301,13 @@ async def media_stream(ws: WebSocket, table_number: int):
             if event == "start":
                 stream_sid = msg["start"]["streamSid"]
                 print(f"[TWILIO] Stream started: {stream_sid}")
-                # Now send opening since we have stream_sid
-                opening = f"Welcome to The Grand Azure! I'm your AI waiter for Table {table_number}. Ready to order?"
-                audio = await deepgram_tts(opening)
-                if audio:
-                    await send_audio_to_twilio(ws, audio, stream_sid)
+                
+                # Send the initial greeting asynchronously so we don't block the media stream
+                async def play_greeting():
+                    audio = await voicebox_tts(opening_message)
+                    if audio:
+                        await send_audio_to_twilio(ws, audio, stream_sid)
+                asyncio.create_task(play_greeting())
 
             elif event == "media":
                 payload = base64.b64decode(msg["media"]["payload"])
@@ -257,6 +320,13 @@ async def media_stream(ws: WebSocket, table_number: int):
     except Exception as e:
         print(f"[ERROR] {e}")
     finally:
+        # Cancel the conversation task so it doesn't leak after disconnect
+        if conversation_task and not conversation_task.done():
+            conversation_task.cancel()
+            try:
+                await conversation_task
+            except asyncio.CancelledError:
+                pass
         await dg_conn.finish()
         print("[WS] Disconnected")
 
@@ -309,28 +379,76 @@ Transcript:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 4. Deepgram TTS — Aura Asteria (most human-sounding)
+# 4. Voicebox Local TTS API (Async Polling)
 # ─────────────────────────────────────────────────────────────────────────────
-async def deepgram_tts(text: str) -> bytes | None:
-    url = "https://api.deepgram.com/v1/speak"
-    params = {
-        "model": "aura-stella-en", # Stella speaks slightly slower and clearer
-        "encoding": "mulaw",       # Twilio requires mulaw (8kHz limit)
-        "sample_rate": 8000,
-        "container": "none",
-    }
-    headers = {
-        "Authorization": f"Token {os.environ['DEEPGRAM_KEY']}",
-        "Content-Type": "application/json",
-    }
+async def convert_to_mulaw(wav_data: bytes) -> bytes | None:
+    # Pure Python conversion without ffmpeg (requires standard libraries)
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(url, params=params, headers=headers,
-                                  json={"text": text})
-            if r.status_code == 200:
-                return r.content
-            print(f"[TTS ERROR] {r.status_code}: {r.text}")
-            return None
+        with wave.open(io.BytesIO(wav_data), 'rb') as wav_file:
+            params = wav_file.getparams()
+            nchannels, sampwidth, framerate, nframes = params[:4]
+            
+            frames = wav_file.readframes(nframes)
+            
+            # Twilio requires 8000 Hz
+            if framerate != 8000:
+                frames, _ = audioop.ratecv(frames, sampwidth, nchannels, framerate, 8000, None)
+            
+            # Twilio requires 1 channel (mono)
+            if nchannels > 1:
+                frames = audioop.tomono(frames, sampwidth, 1, 1)
+            
+            # Convert to mulaw
+            mulaw_frames = audioop.lin2ulaw(frames, sampwidth)
+            return mulaw_frames
+    except Exception as e:
+        print(f"[AUDIO CONVERSION ERROR] Failed to convert audio: {e}")
+        return None
+
+async def voicebox_tts(text: str) -> bytes | None:
+    url = "http://127.0.0.1:17493/generate"
+    try:
+        async with tts_lock:
+            async with httpx.AsyncClient(timeout=15) as client:
+                r = await client.post(url, json={
+                    "text": text,
+                    "profile_id": "4fe7b178-91ce-465c-a32a-7da1875d3302",
+                    "language": "en",
+                    "engine": "luxtts"
+                })
+                if r.status_code != 200:
+                    print(f"[TTS ERROR] {r.status_code}: {r.text}")
+                    return None
+                    
+                gen_id = r.json().get("id")
+                
+                # Read the SSE stream for completion status
+                async with client.stream("GET", f"http://127.0.0.1:17493/generate/{gen_id}/status", timeout=60.0) as poll_r:
+                    async for line in poll_r.aiter_lines():
+                        line = line.strip()
+                        if line.startswith("data:"):
+                            # 'data: {...}' -> get everything after 'data:' and strip whitespace
+                            try:
+                                payload = line[5:].strip()
+                                data = json.loads(payload)
+                                status = data.get("status")
+                                if status == "completed":
+                                    # Fetch the audio
+                                    audio_r = await client.get(f"http://127.0.0.1:17493/audio/{gen_id}")
+                                    if audio_r.status_code == 200:
+                                        mulaw_audio = await convert_to_mulaw(audio_r.content)
+                                        if mulaw_audio:
+                                            print(f"[TTS SUCCESS] Voicebox generated {len(mulaw_audio)} bytes")
+                                            return mulaw_audio
+                                    break
+                                elif status == "failed":
+                                    print("[TTS ERROR] Generation failed in Voicebox.")
+                                    break
+                            except Exception as parse_e:
+                                print(f"[SSE PARSE ERROR] {parse_e}")
+                
+                print("[TTS ERROR] Voicebox generation timed out or stream ended unexpectedly.")
+                return None
     except Exception as e:
         print(f"[TTS EXCEPTION] {e}")
         return None

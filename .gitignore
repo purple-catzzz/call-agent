@@ -6,3 +6,10 @@ __pycache__/
 *.pyd
 transcripts/
 all code.md
+all_source_code.md
+all_code_dump.md
+*.db
+*.wav
+test_voicebox*.py
+openapi*
+real_openapi.json
